@@ -1,6 +1,6 @@
 # Limpa Pintura
 
-Ferramenta no navegador que tira manchas e sujeira da pintura de desenhos com contorno (estilo cartoon), deixa as cores chapadas e converte em vetor (SVG), com PNG de bordas lisas.
+Ferramenta no navegador que padroniza as cores de desenhos com contorno (estilo cartoon): cada cor (base, sombra, brilho) ganha um tom oficial e as manchas passam a usar esse tom. Converte em vetor (SVG) e gera PNG de bordas lisas.
 
 Uso: https://natalisalvatore.github.io/limpa-pintura/
 

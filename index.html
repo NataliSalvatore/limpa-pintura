@@ -76,7 +76,7 @@ progress{width:200px;height:10px;accent-color:var(--accent)}
 <body>
 <header>
   <h1><span>Limpa Pintura</span></h1>
-  <p>Tira manchas, sujeira e degradês sujos da pintura de desenhos com contorno, deixa as cores chapadas e converte em vetor. Baixa em SVG e em PNG com bordas lisas.</p>
+  <p>Padroniza as cores de desenhos com contorno: cada cor (base, sombra, brilho) ganha um tom oficial e as manchas passam a usar esse tom. Converte em vetor e baixa em SVG e PNG com bordas lisas.</p>
 </header>
 <main>
   <section class="panel" aria-label="Ajustes">
@@ -89,9 +89,14 @@ progress{width:200px;height:10px;accent-color:var(--accent)}
     <fieldset>
       <legend>Limpeza</legend>
       <div class="field">
-        <label for="strength">Força da limpeza <output id="strengthO"></output></label>
-        <input type="range" id="strength" autocomplete="off" min="6" max="40" step="1" value="12">
-        <small>Mais forte = tons parecidos dentro da mesma área viram uma cor só (some mancha e sombra). Mais suave = mantém sombras e brilhos.</small>
+        <label for="strength">Constância das cores <output id="strengthO"></output></label>
+        <input type="range" id="strength" autocomplete="off" min="2" max="16" step="1" value="4">
+        <small>Cada cor do desenho ganha um tom oficial (ex.: verde base e verde de sombra do terno) e todo pixel passa a usar o tom oficial mais próximo. Mais alto = menos tons (mais chapado). Mais baixo = mais tons (mais fiel).</small>
+      </div>
+      <div class="field">
+        <label for="speck">Tamanho das manchas a apagar <output id="speckO"></output></label>
+        <input type="range" id="speck" autocomplete="off" min="0" max="0.0002" step="0.00001" value="0.00004">
+        <small>Pingos e manchinhas menores que isso viram a cor em volta. Aumente se ainda sobrar sujeira; diminua se detalhes pequenos sumirem.</small>
       </div>
       <div class="field">
         <label for="thr">O que conta como contorno <output id="thrO"></output></label>
@@ -238,79 +243,60 @@ async function cleanImage(src, opt, report) {
     const dd = new Uint8Array(N); for (const i of front) dd[i] = 1;
     for (let st = 0; st < R2; st++) { const nx = []; for (const i of front) { const y = (i / w) | 0, x = i - y * w;
       for (const j of [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, y > 0 ? i - w : -1, y < h - 1 ? i + w : -1]) if (j >= 0 && !dd[j]) { dd[j] = 1; ring[j] = 1; nx.push(j); } } front = nx; } }
-  // cores por área
-  const T2 = opt.strength * opt.strength, out = new Int32Array(N).fill(-1);   // out: índice na paleta
-  const palette = [];  // [L, a, b, área]
-  const minIsland = Math.max(25, Math.round(N * 1.5e-5));
-  let done = 0;
-  for (const r of regs) {
-    const n = r.px.length; if (n < 12) continue;
-    const pts = new Float32Array(n * 3);
-    for (let k = 0; k < n; k++) { const i = r.px[k]; pts[3*k] = lab[3*i]; pts[3*k+1] = lab[3*i+1]; pts[3*k+2] = lab[3*i+2]; }
-    // amostra sem o anel (se a área for só anel, usa tudo)
-    let core = []; for (let k = 0; k < n; k++) if (!ring[r.px[k]]) core.push(k);
-    if (core.length < Math.max(12, n * 0.15)) core = [...Array(n).keys()];
-    const cp = new Float32Array(core.length * 3); core.forEach((k, t) => { cp[3*t] = pts[3*k]; cp[3*t+1] = pts[3*k+1]; cp[3*t+2] = pts[3*k+2]; });
-    const nc = core.length, K = nc < 200 ? 2 : nc < 3000 ? 4 : nc < 30000 ? 8 : 12;
-    const km = kmeans(cp, nc, K);
-    // junta grupos: do maior para o menor; um grupo só fica separado se for bem diferente dos que já ficaram
-    const order = [...Array(km.k).keys()].sort((a, b) => km.cnt[b] - km.cnt[a]);
-    const kept = [], map = new Int32Array(km.k);
-    for (const j of order) {
-      if (!km.cnt[j]) { map[j] = kept.length ? 0 : (kept.push({ L: km.C[3*j], A: km.C[3*j+1], B: km.C[3*j+2], n: 0 }), 0); continue; }
-      let best = -1, bd = Infinity;
-      kept.forEach((c, q) => { const a = c.L - km.C[3*j], b = c.A - km.C[3*j+1], e = c.B - km.C[3*j+2], dd = a*a + b*b + e*e; if (dd < bd) { bd = dd; best = q; } });
-      const share = km.cnt[j] / nc;
-      if (best >= 0 && (bd < T2 || share < 0.01 || km.cnt[j] < minIsland)) map[j] = best;
-      else { map[j] = kept.length; kept.push({ L: km.C[3*j], A: km.C[3*j+1], B: km.C[3*j+2], n: 0 }); }
-    }
-    // cada pixel vai para a cor mantida mais próxima
-    const lbl = new Int32Array(n).fill(-1), inCore = new Uint8Array(n); for (const k of core) inCore[k] = 1;
-    for (let k = 0; k < n; k++) { if (!inCore[k]) continue; let bq = 0, bd = Infinity; for (let q = 0; q < kept.length; q++) { const c = kept[q], a = pts[3*k] - c.L, b = pts[3*k+1] - c.A, e = pts[3*k+2] - c.B, dd = a*a + b*b + e*e; if (dd < bd) { bd = dd; bq = q; } } lbl[k] = bq; }
-    const loc = new Map(); r.px.forEach((i, k) => loc.set(i, k));
-    { let front = []; for (let k = 0; k < n; k++) if (lbl[k] >= 0) front.push(k);
-      while (front.length) { const nx = []; for (const k of front) { const i = r.px[k]; for (const j of [i - 1, i + 1, i - w, i + w]) { const q = loc.get(j); if (q !== undefined && lbl[q] < 0) { lbl[q] = lbl[k]; nx.push(q); } } } front = nx; }
-      for (let k = 0; k < n; k++) if (lbl[k] < 0) lbl[k] = 0; }
-    if (kept.length > 1) {
-      // alisa a fronteira (maioria 3×3, duas passadas) e absorve ilhas pequenas
-      for (let pass = 0; pass < 2; pass++) {
-        const nl = lbl.slice();
-        for (let k = 0; k < n; k++) { const i = r.px[k], cnt = new Map();
-          for (const j of [i - w - 1, i - w, i - w + 1, i - 1, i + 1, i + w - 1, i + w, i + w + 1]) { const q = loc.get(j); if (q !== undefined) cnt.set(lbl[q], (cnt.get(lbl[q]) || 0) + 1); }
-          let bl = lbl[k], bc = cnt.get(lbl[k]) || 0; for (const [l, c] of cnt) if (c > bc + 1) { bc = c; bl = l; } nl[k] = bl; }
-        lbl.set(nl);
-      }
-      const seen = new Uint8Array(n);
-      for (let k0 = 0; k0 < n; k0++) { if (seen[k0]) continue; const l = lbl[k0], isl = [k0], nbc = new Map(); seen[k0] = 1;
-        for (let t = 0; t < isl.length; t++) { const i = r.px[isl[t]];
-          for (const j of [i - 1, i + 1, i - w, i + w]) { const q = loc.get(j); if (q === undefined) continue; if (lbl[q] === l) { if (!seen[q]) { seen[q] = 1; isl.push(q); } } else nbc.set(lbl[q], (nbc.get(lbl[q]) || 0) + 1); } }
-        if (isl.length < minIsland && nbc.size) { let bl = l, bc = -1; for (const [ll, c] of nbc) if (c > bc) { bc = c; bl = ll; } for (const q of isl) lbl[q] = bl; } }
-    }
-    // cor final = mediana de cada grupo (robusta a resto de mancha)
-    const groups = kept.map(() => []); for (let k = 0; k < n; k++) if (inCore[k]) groups[lbl[k]].push(k);
-    kept.forEach((c, q) => { if (!groups[q].length) for (let k = 0; k < n; k++) if (lbl[k] === q) groups[q].push(k); });
-    const pid = groups.map(g => {
-      if (!g.length) return -1;
-      const med = ch => { const v = g.map(k => pts[3*k+ch]).sort((a, b) => a - b); return v[v.length >> 1]; };
-      const c = [med(0), med(1), med(2)];
-      // paleta global: tons quase iguais em áreas diferentes viram a mesma cor
-      let best = -1, bd = 9; palette.forEach((p, q) => { const a = p[0] - c[0], b = p[1] - c[1], e = p[2] - c[2], dd = a*a + b*b + e*e; if (dd < bd) { bd = dd; best = q; } });
-      if (best < 0) { palette.push([c[0], c[1], c[2], g.length]); return palette.length - 1; }
-      palette[best][3] += g.length; return best;
-    });
-    for (let k = 0; k < n; k++) out[r.px[k]] = pid[lbl[k]];
-    done += n; if (done > N * 0.05) { done = 0; report(0.2 + 0.6 * (r.id / regs.length)); await nextTick(); }
+  // 1) PALETA OFICIAL: agrupa as cores da imagem toda (sem traço e sem o meio-tom junto do traço) em muitos tons
+  //    e junta os tons quase iguais. O tom que fica é o MAIS FREQUENTE do grupo (a cor que o artista "definiu"),
+  //    não a média — assim a mancha não puxa a cor.
+  const samp = []; { const step = Math.max(1, Math.floor(N / 120000)); for (let i = 0; i < N; i += step) if (!line[i] && !ring[i] && reg[i] >= 0) samp.push(i); }
+  const sp = new Float32Array(samp.length * 3); samp.forEach((i, k) => { sp[3*k] = lab[3*i]; sp[3*k+1] = lab[3*i+1]; sp[3*k+2] = lab[3*i+2]; });
+  const km = kmeans(sp, samp.length, 48, 10);
+  report(0.35); await nextTick();
+  const T2 = opt.strength * opt.strength, tones = [];
+  for (const j of [...Array(km.k).keys()].sort((a, b) => km.cnt[b] - km.cnt[a])) {
+    if (!km.cnt[j]) continue;
+    const c = [km.C[3*j], km.C[3*j+1], km.C[3*j+2]];
+    let best = -1, bd = Infinity; tones.forEach((t, q) => { const a = t[0] - c[0], b = t[1] - c[1], e = t[2] - c[2], dd = a*a + b*b + e*e; if (dd < bd) { bd = dd; best = q; } });
+    if (best >= 0 && bd < T2) tones[best][3] += km.cnt[j]; else tones.push([c[0], c[1], c[2], km.cnt[j]]);
   }
+  // 2) cada pixel recebe o tom oficial mais próximo
+  const out = new Int32Array(N).fill(-1);
+  for (let i = 0; i < N; i++) { if (line[i] || ring[i] || reg[i] < 0) continue; let bq = 0, bd = Infinity;
+    for (let q = 0; q < tones.length; q++) { const t = tones[q], a = lab[3*i] - t[0], b = lab[3*i+1] - t[1], e = lab[3*i+2] - t[2], dd = a*a + b*b + e*e; if (dd < bd) { bd = dd; bq = q; } } out[i] = bq; }
+  report(0.5); await nextTick();
+  // meio-tom junto do traço herda o vizinho de dentro da mesma área
+  { let front = []; for (let i = 0; i < N; i++) if (out[i] >= 0) front.push(i);
+    while (front.length) { const nx = []; for (const i of front) { const y = (i / w) | 0, x = i - y * w;
+      for (const j of [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, y > 0 ? i - w : -1, y < h - 1 ? i + w : -1]) if (j >= 0 && out[j] < 0 && !line[j] && reg[j] === reg[i]) { out[j] = out[i]; nx.push(j); } } front = nx; } }
+  // 3) limpeza espacial: mancha = pequena E de cor parecida com a vizinha. Só nesses casos o pixel/ilha vira o
+  //    tom em volta; detalhe de cor bem diferente (contorno da ervilha, brilho) fica.
+  const near = (p, q) => { const a = tones[p], b = tones[q], x = a[0] - b[0], y = a[1] - b[1], z = a[2] - b[2]; return x*x + y*y + z*z < ABS2; };
+  const ABS2 = Math.pow(Math.max(12, opt.strength * 3), 2);
+  for (let pass = 0; pass < 2; pass++) {
+    const nl = out.slice();
+    for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) { const i = y * w + x; if (out[i] < 0) continue; const cnt = new Map();
+      for (const j of [i - w - 1, i - w, i - w + 1, i - 1, i + 1, i + w - 1, i + w, i + w + 1]) if (out[j] >= 0 && reg[j] === reg[i]) cnt.set(out[j], (cnt.get(out[j]) || 0) + 1);
+      let bl = out[i], bc = cnt.get(out[i]) || 0; for (const [l, c] of cnt) if (c > bc + 1) { bc = c; bl = l; } if (bl !== out[i] && near(bl, out[i])) nl[i] = bl; }
+    out.set(nl);
+  }
+  report(0.6); await nextTick();
+  const minIsland = Math.max(30, Math.round(N * opt.speck));
+  { const seen = new Uint8Array(N), st = new Int32Array(N);
+    for (let s0 = 0; s0 < N; s0++) { if (out[s0] < 0 || seen[s0]) continue; const t = out[s0], R0 = reg[s0]; let sp2 = 0; st[sp2++] = s0; seen[s0] = 1; const isl = []; const nbc = new Map();
+      while (sp2) { const i = st[--sp2]; isl.push(i); const y = (i / w) | 0, x = i - y * w;
+        for (const j of [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, y > 0 ? i - w : -1, y < h - 1 ? i + w : -1]) { if (j < 0 || out[j] < 0 || reg[j] !== R0) continue;
+          if (out[j] === t) { if (!seen[j]) { seen[j] = 1; st[sp2++] = j; } } else nbc.set(out[j], (nbc.get(out[j]) || 0) + 1); } }
+      if (isl.length < minIsland && nbc.size) { let bl = t, bc = -1; for (const [l, c] of nbc) if (c > bc) { bc = c; bl = l; } if (near(bl, t)) for (const i of isl) out[i] = bl; } } }
+  const palette = tones;
   // cor do traço = mediana dos pixels bem escuros
   const lv = []; for (let i = 0; i < N; i += 3) if (line[i] && lab[3*i] < opt.thr * 0.6) lv.push(i);
   const lineRGB = lv.length ? [0, 1, 2].map(ch => { const v = lv.map(i => d[4*i+ch]).sort((a, b) => a - b); return v[v.length >> 1]; }) : [15, 15, 15];
   const palRGB = palette.map(p => labToRgb(p[0], p[1], p[2]));
+  const used = new Set(); for (let i = 0; i < N; i++) if (out[i] >= 0) used.add(out[i]);
   // fundo = cor mais comum na borda
   const bc = new Map(); for (let x = 0; x < w; x++) for (const y of [0, h - 1]) { const q = out[y * w + x]; if (q >= 0) bc.set(q, (bc.get(q) || 0) + 1); }
   for (let y = 0; y < h; y++) for (const x of [0, w - 1]) { const q = out[y * w + x]; if (q >= 0) bc.set(q, (bc.get(q) || 0) + 1); }
   let bgId = -1, bn = -1; for (const [q, n] of bc) if (n > bn) { bn = n; bgId = q; }
   report(0.85);
-  return { w, h, out, line, palette, palRGB, lineRGB, bgId };
+  return { w, h, out, line, palette, palRGB, lineRGB, bgId, nColors: used.size };
 }
 
 function labToRgb(L, A, B) {
@@ -344,6 +330,9 @@ async function vectorize(R, opt, report) {
         if (m[k - 1] || m[k + 1] || m[k - cw] || m[k + cw]) nm[k] = 1; }
       m.set(nm);
     }
+    if (pad) { const nm = m.slice();   // +1 px sobre a cor vizinha: sem frestas entre áreas
+      for (let y = 1; y < ch - 1; y++) for (let x = 1; x < cw - 1; x++) { const k = y * cw + x; if (!m[k] && (m[k - 1] || m[k + 1] || m[k - cw] || m[k + cw])) nm[k] = 1; }
+      m.set(nm); }
     const img = new ImageData(cw, ch); for (let k = 0; k < cw * ch; k++) { const v = m[k] ? 0 : 255; img.data[4*k] = v; img.data[4*k+1] = v; img.data[4*k+2] = v; img.data[4*k+3] = 255; }
     const svg = await potrace(img, tOpts);
     const g = (svg.match(/<g[^>]*>([\s\S]*)<\/g>/) || [])[1] || '';
@@ -368,7 +357,7 @@ function svgToCanvas(svg, W, H) {
 }
 
 /* ---------- fluxo ---------- */
-function readOpts() { return { strength: +$('strength').value, thr: +$('thr').value, smooth: +$('smooth').value, scale: $('scale').value, png: $('getPng').checked, svg: $('getSvg').checked }; }
+function readOpts() { return { strength: +$('strength').value, speck: +$('speck').value, thr: +$('thr').value, smooth: +$('smooth').value, scale: $('scale').value, png: $('getPng').checked, svg: $('getSvg').checked }; }
 function setStatus(m, k) { const s = $('status'); s.textContent = m; s.className = 'status' + (k ? ' ' + k : ''); }
 const MAXW = 2048;   // resolução de trabalho (o vetor depois pode ser exportado maior)
 
@@ -387,9 +376,9 @@ async function processCurrent() {
   const svg = await vectorize(R, opt, report);
   const after = await svgToCanvas(svg, w, h);
   prog.value = 1; prog.hidden = true;
-  S.res = { svg, w, h, natW: img.naturalWidth, natH: img.naturalHeight, colors: R.palette.length, ms: performance.now() - t0 };
+  S.res = { svg, w, h, natW: img.naturalWidth, natH: img.naturalHeight, colors: R.nColors, ms: performance.now() - t0 };
   showCompare(src, after);
-  $('stats').innerHTML = `<span class="chip"><b>${R.palette.length}</b> cores finais</span><span class="chip">${img.naturalWidth}×${img.naturalHeight} px</span><span class="chip">SVG de <b>${Math.max(1, Math.round(svg.length / 1024))} KB</b></span><span class="chip">${(S.res.ms / 1000).toFixed(1)} s</span>`;
+  $('stats').innerHTML = `<span class="chip"><b>${R.nColors}</b> tons oficiais</span><span class="chip">${img.naturalWidth}×${img.naturalHeight} px</span><span class="chip">SVG de <b>${Math.max(1, Math.round(svg.length / 1024))} KB</b></span><span class="chip">${(S.res.ms / 1000).toFixed(1)} s</span>`;
   setStatus('');
   return S.res;
 }
@@ -426,7 +415,7 @@ async function save(blob, filename) {
   const a = document.createElement('a'), url = URL.createObjectURL(blob); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
 
-function setBusy(b) { S.busy = b; ['dlBtn', 'redo', 'strength', 'thr', 'smooth', 'scale', 'getPng', 'getSvg'].forEach(id => $(id).disabled = b); }
+function setBusy(b) { S.busy = b; ['dlBtn', 'redo', 'strength', 'speck', 'thr', 'smooth', 'scale', 'getPng', 'getSvg'].forEach(id => $(id).disabled = b); }
 
 async function runOne() {
   if (S.busy || !S.img) return; setBusy(true);
@@ -457,7 +446,7 @@ async function runBatch(files) {
     if (S.cancel) { for (let j = k; j < files.length; j++) mark(j, '', 'cancelado'); break; }
     const f = files[k], url = URL.createObjectURL(f); $('batchStatus').textContent = `${k + 1} de ${files.length}`; mark(k, 'now', 'limpando…');
     try { await loadFromSrc(url, f.name); $('fname').textContent = f.name; const res = await processCurrent();
-      for (const [n, b] of await outputs(res, f.name)) await save(b, n); ok++; mark(k, 'ok', `baixado · ${res.colors} cores · ${(res.ms / 1000).toFixed(0)} s`); }
+      for (const [n, b] of await outputs(res, f.name)) await save(b, n); ok++; mark(k, 'ok', `baixado · ${res.colors} tons · ${(res.ms / 1000).toFixed(0)} s`); }
     catch (e) { mark(k, 'err', S.cancel ? 'cancelado' : 'erro: ' + (e.message || e)); }
     finally { URL.revokeObjectURL(url); }
   }
@@ -483,7 +472,8 @@ document.addEventListener('dragover', e => e.preventDefault());
 document.addEventListener('drop', e => { e.preventDefault(); if (!drop.contains(e.target)) pick(e.dataTransfer.files); });
 
 const bindOut = (id, fmt) => { const el = $(id), o = $(id + 'O'); const f = () => o.textContent = fmt(+el.value); el.addEventListener('input', f); f(); };
-bindOut('strength', v => v <= 9 ? `${v} · suave` : v <= 16 ? `${v} · tira manchas, mantém sombras` : `${v} · forte (tira sombras também)`);
+bindOut('strength', v => v <= 3 ? `${v} · mais fiel` : v <= 7 ? `${v} · equilibrado` : `${v} · mais chapado`);
+bindOut('speck', v => v === 0 ? 'nenhuma' : v <= 0.00003 ? 'pequenas' : v <= 0.00008 ? 'médias' : 'grandes');
 bindOut('thr', v => v); bindOut('smooth', v => v.toFixed(2));
 
 /* exemplo inicial: pato desenhado com sujeira de propósito */
