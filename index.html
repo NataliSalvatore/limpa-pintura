@@ -296,7 +296,7 @@ async function cleanImage(src, opt, report) {
   for (let y = 0; y < h; y++) for (const x of [0, w - 1]) { const q = out[y * w + x]; if (q >= 0) bc.set(q, (bc.get(q) || 0) + 1); }
   let bgId = -1, bn = -1; for (const [q, n] of bc) if (n > bn) { bn = n; bgId = q; }
   report(0.85);
-  return { w, h, out, line, palette, palRGB, lineRGB, bgId, nColors: used.size };
+  return { w, h, out, line, reg, palette, palRGB, lineRGB, bgId, nColors: used.size };
 }
 
 function labToRgb(L, A, B) {
@@ -315,7 +315,16 @@ async function vectorize(R, opt, report) {
   await potraceReady;
   const { w, h, out, line } = R, N = w * h;
   const layers = [];
-  const byColor = new Map(); for (let i = 0; i < N; i++) { const q = out[i]; if (q >= 0 && q !== R.bgId) { let L = byColor.get(q); if (!L) byColor.set(q, L = []); L.push(i); } }
+  // camadas empilhadas, sem frestas: 1) cada área fechada pelo traço é pintada INTEIRA com o seu tom principal;
+  // 2) por cima, os outros tons da área (sombras, brilhos); 3) o traço por cima de tudo.
+  // Se sobrar uma fresta entre uma sombra e a cor base, aparece a cor base, nunca o fundo branco.
+  const reg = R.reg, domOf = new Map();
+  { const cnt = new Map(); for (let i = 0; i < N; i++) { const r = reg[i], q = out[i]; if (r < 0 || q < 0) continue; let m = cnt.get(r); if (!m) cnt.set(r, m = new Map()); m.set(q, (m.get(q) || 0) + 1); }
+    for (const [r, m] of cnt) { let bq = -1, bn = -1; for (const [q, n] of m) if (n > bn) { bn = n; bq = q; } domOf.set(r, bq); } }
+  const baseBy = new Map(), topBy = new Map();
+  for (let i = 0; i < N; i++) { const r = reg[i]; if (r < 0 || out[i] < 0) continue; const dq = domOf.get(r), q = out[i];
+    if (dq !== R.bgId) { let L = baseBy.get(dq); if (!L) baseBy.set(dq, L = []); L.push(i); }
+    if (q !== dq) { let L = topBy.get(q); if (!L) topBy.set(q, L = []); L.push(i); } }
   // distância ao traço para avançar a cor por baixo dele (até ~meia espessura de traço)
   const grow = Math.max(2, Math.round(Math.min(w, h) / 400));
   const tOpts = { turdsize: 4, turnpolicy: 4, alphamax: opt.smooth, opticurve: 1, opttolerance: 0.2, pathonly: false, extractcolors: false };
@@ -338,9 +347,10 @@ async function vectorize(R, opt, report) {
     const g = (svg.match(/<g[^>]*>([\s\S]*)<\/g>/) || [])[1] || '';
     return `<g transform="translate(${x0},${y0 + ch}) scale(0.1,-0.1)">${g.replace(/fill="[^"]*"/g, '')}</g>`;
   };
-  const cols = [...byColor.entries()].sort((a, b) => b[1].length - a[1].length);
-  let k = 0;
-  for (const [q, px] of cols) { if (S.cancel) throw new Error('cancelado'); layers.push(`<g fill="${hex(R.palRGB[q])}">${await trace(px, grow)}</g>`); report(0.85 + 0.12 * (++k / cols.length)); }
+  const base = [...baseBy.entries()].sort((a, b) => b[1].length - a[1].length), top = [...topBy.entries()].sort((a, b) => b[1].length - a[1].length);
+  const total = base.length + top.length || 1; let k = 0;
+  for (const [q, px] of base) { if (S.cancel) throw new Error('cancelado'); layers.push(`<g fill="${hex(R.palRGB[q])}">${await trace(px, grow)}</g>`); report(0.85 + 0.12 * (++k / total)); }
+  for (const [q, px] of top) { if (S.cancel) throw new Error('cancelado'); layers.push(`<g fill="${hex(R.palRGB[q])}">${await trace(px, grow)}</g>`); report(0.85 + 0.12 * (++k / total)); }
   const lp = []; for (let i = 0; i < N; i++) if (line[i]) lp.push(i);
   const lineLayer = lp.length ? `<g fill="${hex(R.lineRGB)}">${await trace(lp, 0)}</g>` : '';
   const bg = R.bgId >= 0 ? hex(R.palRGB[R.bgId]) : '#ffffff';
