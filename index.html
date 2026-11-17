@@ -115,16 +115,23 @@ progress{width:200px;height:10px;accent-color:var(--accent)}
       <div class="field">
         <label for="mode">Tipo de limpeza</label>
         <select id="mode" autocomplete="off">
-          <option value="raster" selected>PNG direto (sem ranhuras)</option>
+          <option value="suave" selected>Suave (igual ao limpa-pato do ChatGPT)</option>
+          <option value="raster">Chapado (tons padronizados)</option>
           <option value="vector">Vetor (PNG feito do SVG)</option>
         </select>
-        <small>PNG direto: padroniza as cores pixel a pixel, mantém as bordas suaves do original. Vetor: tudo vira curva (bom para ampliar muito).</small>
+        <small>Suave: apaga as manchas e mantém sombras e degradês. Chapado: um tom fixo por parte. Vetor: tudo vira curva.</small>
       </div>
+      <div class="field">
+        <label for="clean">Limpeza (modo Suave) <output id="cleanO"></output></label>
+        <input type="range" id="clean" autocomplete="off" min="0" max="2" step="1" value="1">
+        <small>Leve = mais detalhe. Alta = menos ruído.</small>
+      </div>
+      <label class="check"><input type="checkbox" id="paper" autocomplete="off" checked> Uniformizar papel quase branco</label>
       <div class="field">
         <label for="scale">Tamanho do PNG</label>
         <select id="scale" autocomplete="off">
           <option value="1">Tamanho original</option>
-          <option value="2">2× (dobro)</option>
+          <option value="2" selected>2× (dobro)</option>
           <option value="4k">4K (lado maior 3840 px)</option>
         </select>
       </div>
@@ -163,6 +170,7 @@ progress{width:200px;height:10px;accent-color:var(--accent)}
   </section>
 </main>
 
+<script src="retouch.js"></script>
 <script type="module">
 import { potrace, init as initPotrace } from './potrace.js';
 "use strict";
@@ -396,12 +404,40 @@ function svgToCanvas(svg, W, H) {
 }
 
 /* ---------- fluxo ---------- */
-function readOpts() { return { strength: +$('strength').value, speck: +$('speck').value, thr: +$('thr').value, smooth: +$('smooth').value, mode: $('mode').value, scale: $('scale').value, png: $('getPng').checked, svg: $('getSvg').checked }; }
+function readOpts() { return { strength: +$('strength').value, speck: +$('speck').value, thr: +$('thr').value, smooth: +$('smooth').value, mode: $('mode').value, clean: +$('clean').value, paper: $('paper').checked, scale: $('scale').value, png: $('getPng').checked, svg: $('getSvg').checked }; }
 function setStatus(m, k) { const s = $('status'); s.textContent = m; s.className = 'status' + (k ? ' ' + k : ''); }
 const MAXW = { vector: 2048, raster: 4096 };   // resolução de trabalho (o vetor depois pode ser exportado maior)
 
+// modo Suave: mesmo processo do limpa-pato (retouch.js, domínio público)
+function retouchRun(input, value, paper) {
+  return new Promise((res, rej) => {
+    if (location.protocol === 'file:' || typeof Worker === 'undefined') { try { res(removeSpecks(input, value, paper)); } catch (e) { rej(e); } return; }
+    let wk; try { wk = new Worker('retouch-worker.js'); } catch (e) { try { res(removeSpecks(input, value, paper)); } catch (e2) { rej(e2); } return; }
+    wk.onmessage = e => { wk.terminate(); res(e.data); };
+    wk.onerror = e => { wk.terminate(); try { res(removeSpecks(input, value, paper)); } catch (e2) { rej(e2); } };
+    wk.postMessage({ input, value, paper }, [input.data.buffer]);
+  });
+}
+async function processSuave(opt) {
+  const img = S.img, W0 = img.naturalWidth, H0 = img.naturalHeight, t0 = performance.now(), prog = $('prog');
+  const k = Math.min(1, Math.sqrt(8000000 / (W0 * H0)), 8192 / Math.max(W0, H0));
+  const w = Math.max(1, Math.round(W0 * k)), h = Math.max(1, Math.round(H0 * k));
+  const src = mkCanvas(w, h); src.getContext('2d').drawImage(img, 0, 0, w, h);
+  const c = mkCanvas(w, h), ctx = c.getContext('2d', { willReadFrequently: true }); ctx.drawImage(src, 0, 0);
+  prog.hidden = false; prog.removeAttribute('value'); setStatus('Limpando manchas…'); await nextTick();
+  const bytes = await retouchRun(ctx.getImageData(0, 0, w, h), opt.clean, opt.paper);
+  ctx.putImageData(new ImageData(bytes, w, h), 0, 0);
+  prog.value = 1; prog.hidden = true;
+  S.res = { svg: null, raster: c, suave: true, R: null, w, h, natW: W0, natH: H0, colors: null, ms: performance.now() - t0 };
+  showCompare(src, c);
+  $('stats').innerHTML = `<span class="chip">limpeza <b>${['leve', 'média', 'alta'][opt.clean]}</b></span><span class="chip">${W0}×${H0} px</span><span class="chip">${(S.res.ms / 1000).toFixed(1)} s</span>`;
+  setStatus('');
+  return S.res;
+}
+
 async function processCurrent() {
   const opt = readOpts(), img = S.img, prog = $('prog');
+  if (opt.mode === 'suave') return processSuave(opt);
   const s = Math.min(1, MAXW[opt.mode] / Math.max(img.naturalWidth, img.naturalHeight));
   const w = Math.max(1, Math.round(img.naturalWidth * s)), h = Math.max(1, Math.round(img.naturalHeight * s));
   const src = mkCanvas(w, h), sx = src.getContext('2d', { willReadFrequently: true });
@@ -438,11 +474,16 @@ function setSplit(f) { $('afterWrap').style.clipPath = `inset(0 0 0 ${f * 100}%)
 async function outputs(res, name) {
   const opt = readOpts(), base = (name || 'desenho').replace(/\.[a-z0-9]+$/i, '').replace(/[^\w\-]+/g, '-').slice(0, 60) || 'desenho';
   const files = [];
-  if (opt.svg && !res.svg) { setStatus('Gerando o SVG…'); res.svg = await vectorize(res.R, opt, () => {}); setStatus(''); }
+  if (opt.svg && !res.svg) { setStatus('Gerando o SVG…');
+    if (!res.R) { const k = Math.min(1, 2048 / Math.max(res.w, res.h)), cw = Math.round(res.w * k), chh = Math.round(res.h * k), sc = mkCanvas(cw, chh), sx = sc.getContext('2d', { willReadFrequently: true });
+      sx.fillStyle = '#fff'; sx.fillRect(0, 0, cw, chh); sx.imageSmoothingQuality = 'high'; sx.drawImage(res.raster, 0, 0, cw, chh); res.R = await cleanImage(sc, opt, () => {}); }
+    res.svg = await vectorize(res.R, opt, () => {}); setStatus(''); }
   if (opt.svg) files.push([`${base}-limpo.svg`, new Blob([res.svg], { type: 'image/svg+xml' })]);
   if (opt.png) {
     let W = res.natW, H = res.natH;
-    if (opt.scale === '2') { W *= 2; H *= 2; } else if (opt.scale === '4k') { const k = 3840 / Math.max(W, H); W = Math.round(W * k); H = Math.round(H * k); }
+    if (res.suave) { const cw = res.raster.width, chh = res.raster.height, want = opt.scale === '2' ? 2 : opt.scale === '4k' ? 3840 / Math.max(cw, chh) : 1;
+      const f = Math.max(1, Math.min(want, Math.sqrt(16000000 / (cw * chh)), 8192 / Math.max(cw, chh))); W = Math.round(cw * f); H = Math.round(chh * f); }
+    else if (opt.scale === '2') { W *= 2; H *= 2; } else if (opt.scale === '4k') { const k = 3840 / Math.max(W, H); W = Math.round(W * k); H = Math.round(H * k); }
     let c;
     if (res.raster) { c = mkCanvas(W, H); const cx = c.getContext('2d'); cx.imageSmoothingQuality = 'high'; cx.drawImage(res.raster, 0, 0, W, H); }
     else c = await svgToCanvas(res.svg, W, H);
@@ -457,7 +498,7 @@ async function save(blob, filename) {
   const a = document.createElement('a'), url = URL.createObjectURL(blob); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
 
-function setBusy(b) { S.busy = b; ['dlBtn', 'redo', 'strength', 'speck', 'thr', 'smooth', 'mode', 'scale', 'getPng', 'getSvg'].forEach(id => $(id).disabled = b); }
+function setBusy(b) { S.busy = b; ['dlBtn', 'redo', 'strength', 'speck', 'thr', 'smooth', 'mode', 'clean', 'paper', 'scale', 'getPng', 'getSvg'].forEach(id => $(id).disabled = b); }
 
 async function runOne() {
   if (S.busy || !S.img) return; setBusy(true);
@@ -488,7 +529,7 @@ async function runBatch(files) {
     if (S.cancel) { for (let j = k; j < files.length; j++) mark(j, '', 'cancelado'); break; }
     const f = files[k], url = URL.createObjectURL(f); $('batchStatus').textContent = `${k + 1} de ${files.length}`; mark(k, 'now', 'limpando…');
     try { await loadFromSrc(url, f.name); $('fname').textContent = f.name; const res = await processCurrent();
-      for (const [n, b] of await outputs(res, f.name)) await save(b, n); ok++; mark(k, 'ok', `baixado · ${res.colors} tons · ${(res.ms / 1000).toFixed(0)} s`); }
+      for (const [n, b] of await outputs(res, f.name)) await save(b, n); ok++; mark(k, 'ok', `baixado · ${res.colors ? res.colors + ' tons · ' : ''}${(res.ms / 1000).toFixed(0)} s`); }
     catch (e) { mark(k, 'err', S.cancel ? 'cancelado' : 'erro: ' + (e.message || e)); }
     finally { URL.revokeObjectURL(url); }
   }
@@ -516,7 +557,7 @@ document.addEventListener('drop', e => { e.preventDefault(); if (!drop.contains(
 const bindOut = (id, fmt) => { const el = $(id), o = $(id + 'O'); const f = () => o.textContent = fmt(+el.value); el.addEventListener('input', f); f(); };
 bindOut('strength', v => v <= 3 ? `${v} · mais fiel` : v <= 7 ? `${v} · equilibrado` : `${v} · mais chapado`);
 bindOut('speck', v => v === 0 ? 'nenhuma' : v <= 0.00003 ? 'pequenas' : v <= 0.00008 ? 'médias' : 'grandes');
-bindOut('thr', v => v); bindOut('smooth', v => v.toFixed(2));
+bindOut('thr', v => v); bindOut('clean', v => ['Leve', 'Média', 'Alta'][v]); bindOut('smooth', v => v.toFixed(2));
 
 /* exemplo inicial: pato desenhado com sujeira de propósito */
 (async () => {
